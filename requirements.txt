@@ -1,7 +1,7 @@
-fyers-apiv2
-pandas
-numpy
-ta
-yfinance
-requests
+flask
 schedule
+requests
+pandas
+python-dotenv
+fyers-apiv3
+pytz

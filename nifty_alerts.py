@@ -1,20 +1,14 @@
 """
-NIFTY-50 Alert System – Fyers API v3 (stable)
+NIFTY-50 Alert System – Render Free-Tier Compatible (Flask + Scheduler)
 Author: 2025
 
-Features
----------
-• Auto-refresh Fyers v3 access token
-• Fallback to Yahoo Finance if Fyers unavailable
-• Detects RSI divergences + EMA5/EMA21 crossovers (15 min)
-• Sends WhatsApp + Email (Zapier Webhook) alerts
-• 10 AM IST EMA status alert (skips market holidays/weekends)
-• Optional Debug Mode: shows EMA5/EMA21 each run
+Runs as a web service with background scheduler (works on Render Free Tier)
 """
 
+import os, json, time, datetime, threading, requests, schedule, pytz
 import pandas as pd
 import numpy as np
-import requests, time, schedule, datetime, json, os, pytz
+from flask import Flask
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
 
@@ -22,58 +16,27 @@ from ta.trend import EMAIndicator
 # --- Load configuration ---
 # =========================================================
 CFG_PATH = "config.json"
-if not os.path.exists(CFG_PATH):
-    raise FileNotFoundError("config.json not found! Please create one.")
+if os.path.exists(CFG_PATH):
+    with open(CFG_PATH) as f:
+        cfg = json.load(f)
+else:
+    cfg = {}
 
-with open(CFG_PATH) as f:
-    cfg = json.load(f)
-
-FYERS_ID       = cfg["client_id"]
-FYERS_SECRET   = cfg["secret_key"]
-REDIRECT_URI   = cfg.get("redirect_uri", "https://127.0.0.1/")
-ACCESS_TOKEN   = cfg.get("access_token", "")
-REFRESH_TOKEN  = cfg.get("refresh_token", "")
-WHATSAPP_URL   = cfg.get("whatsapp_url", "")
-EMAIL_WEBHOOK  = cfg.get("email_webhook", "")
-DEBUG_MODE     = cfg.get("debug_mode", True)
+FYERS_ID       = cfg.get("client_id", os.getenv("FYERS_ID", ""))
+FYERS_SECRET   = cfg.get("secret_key", os.getenv("FYERS_SECRET", ""))
+REDIRECT_URI   = cfg.get("redirect_uri", os.getenv("REDIRECT_URI", "https://127.0.0.1/"))
+ACCESS_TOKEN   = cfg.get("access_token", os.getenv("ACCESS_TOKEN", ""))
+REFRESH_TOKEN  = cfg.get("refresh_token", os.getenv("REFRESH_TOKEN", ""))
+WHATSAPP_URL   = cfg.get("whatsapp_url", os.getenv("WHATSAPP_URL", ""))
+EMAIL_WEBHOOK  = cfg.get("email_webhook", os.getenv("EMAIL_WEBHOOK", ""))
+DEBUG_MODE     = json.loads(os.getenv("DEBUG_MODE", "true")).__bool__()
 
 SYMBOL_FYERS   = "NSE:NIFTY50-INDEX"
-SYMBOL_YF      = "^NSEI"
 INTERVAL       = "15"
 LOOKBACK       = 90
 
 # =========================================================
-# --- Market holiday detection ---
-# =========================================================
-HOLIDAY_URL = "https://www.nseindia.com/api/holiday-master?type=trading"
-_last_holidays = {"date": None, "list": []}
-
-def is_market_holiday(date=None):
-    """Check if NSE is closed (weekend or official holiday)."""
-    global _last_holidays
-    if date is None:
-        date = datetime.date.today()
-
-    # Skip weekends
-    if date.weekday() >= 5:
-        return True
-
-    # Cache NSE holiday list once per week
-    if not _last_holidays["date"] or (date - _last_holidays["date"]).days >= 7:
-        try:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            res = requests.get(HOLIDAY_URL, headers=headers, timeout=10)
-            data = res.json()
-            holidays = [datetime.datetime.strptime(h["tradingDate"], "%d-%b-%Y").date()
-                        for h in data.get("CM", [])]
-            _last_holidays = {"date": date, "list": holidays}
-        except Exception as e:
-            print("⚠️ Could not update NSE holiday list:", e)
-
-    return date in _last_holidays["list"]
-
-# =========================================================
-# --- Token refresh ---
+# --- Fyers Token Refresh ---
 # =========================================================
 def refresh_fyers_token():
     global ACCESS_TOKEN, REFRESH_TOKEN
@@ -93,16 +56,17 @@ def refresh_fyers_token():
             cfg["refresh_token"] = REFRESH_TOKEN
             cfg["last_refresh"] = str(datetime.datetime.now())
             json.dump(cfg, open(CFG_PATH, "w"), indent=2)
-            print("✅ Fyers token refreshed successfully.")
+            print("✅ Token refreshed successfully.")
             return True
-        print("⚠️ Token refresh failed:", data)
-        return False
+        else:
+            print("⚠️ Token refresh failed:", data)
+            return False
     except Exception as e:
         print("⚠️ Error refreshing token:", e)
         return False
 
 # =========================================================
-# --- Data fetch (Fyers + Yahoo fallback) ---
+# --- Fetch from Fyers / Yahoo ---
 # =========================================================
 def get_data_fyers():
     try:
@@ -119,7 +83,7 @@ def get_data_fyers():
         res = fy.history(payload)
         if not res or "candles" not in res:
             if res.get("code") == -16:
-                print("⚠️ Token invalid; refreshing...")
+                print("⚠️ Token invalid; trying refresh ...")
                 if refresh_fyers_token():
                     return get_data_fyers()
             raise ValueError(f"Unexpected response: {res}")
@@ -138,52 +102,51 @@ def get_data_yfinance():
         headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, params=params, headers=headers, timeout=10)
         data = r.json()
+        if "chart" not in data or not data["chart"].get("result"):
+            print("⚠️ Yahoo data invalid.")
+            return None
         result = data["chart"]["result"][0]
+        timestamps = result.get("timestamp", [])
+        indicators = result["indicators"]["quote"][0]
         df = pd.DataFrame({
-            "time": pd.to_datetime(result["timestamp"], unit="s"),
-            "open": result["indicators"]["quote"][0]["open"],
-            "high": result["indicators"]["quote"][0]["high"],
-            "low": result["indicators"]["quote"][0]["low"],
-            "close": result["indicators"]["quote"][0]["close"],
-            "volume": result["indicators"]["quote"][0]["volume"]
+            "time": pd.to_datetime(timestamps, unit="s"),
+            "open": indicators.get("open", []),
+            "high": indicators.get("high", []),
+            "low": indicators.get("low", []),
+            "close": indicators.get("close", []),
+            "volume": indicators.get("volume", [])
         }).dropna()
-        print(f"✅ Using Yahoo REST API data ({len(df)} bars)")
+        print(f"✅ Using Yahoo Finance data ({len(df)} bars)")
         return df
     except Exception as e:
         print("⚠️ Yahoo fetch failed:", e)
         return None
 
 # =========================================================
-# --- Signal computation ---
+# --- Signal Computation ---
 # =========================================================
-def compute_signals(df: pd.DataFrame):
+def compute_signals(df):
     df["rsi"]   = RSIIndicator(df["close"], window=14).rsi()
     df["ema5"]  = EMAIndicator(df["close"], window=5).ema_indicator()
     df["ema21"] = EMAIndicator(df["close"], window=21).ema_indicator()
-
     df["ema_bull"] = (df["ema5"] > df["ema21"]) & (df["ema5"].shift(1) <= df["ema21"].shift(1))
     df["ema_bear"] = (df["ema5"] < df["ema21"]) & (df["ema5"].shift(1) >= df["ema21"].shift(1))
     df["bull_div"] = (df["close"] < df["close"].shift(LOOKBACK)) & (df["rsi"] > df["rsi"].shift(LOOKBACK))
     df["bear_div"] = (df["close"] > df["close"].shift(LOOKBACK)) & (df["rsi"] < df["rsi"].shift(LOOKBACK))
-
     last = df.iloc[-1]
     signals = []
     if last["ema_bull"]: signals.append("📈 EMA Bullish Cross — EMA5 > EMA21")
     if last["ema_bear"]: signals.append("📉 EMA Bearish Cross — EMA5 < EMA21")
     if last["bull_div"]: signals.append("🟢 Bullish RSI Divergence")
     if last["bear_div"]: signals.append("🔴 Bearish RSI Divergence")
-
     if DEBUG_MODE:
         diff = last["ema5"] - last["ema21"]
         trend = "Bullish" if diff > 0 else "Bearish"
-        msg = f"🧭 EMA Status — Close: {last['close']:.2f}, EMA5: {last['ema5']:.2f}, " f"EMA21: {last['ema21']:.2f}, Diff: {diff:.2f} → {trend}"
-        print(msg)
-        send_alert(msg)
-
+        print(f"🧭 EMA Status — Close: {last['close']:.2f}, EMA5: {last['ema5']:.2f}, EMA21: {last['ema21']:.2f}, Diff: {diff:.2f} → {trend}")
     return signals
 
 # =========================================================
-# --- Alert delivery ---
+# --- Alert Delivery ---
 # =========================================================
 def send_alert(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -198,7 +161,7 @@ def send_alert(msg):
         print("⚠️ Alert send failed:", e)
 
 # =========================================================
-# --- Regular 15-min job ---
+# --- Scheduled Jobs ---
 # =========================================================
 def job():
     df = get_data_fyers() or get_data_yfinance()
@@ -211,21 +174,11 @@ def job():
     for s in signals:
         send_alert(s)
 
-# =========================================================
-# --- 10AM Daily EMA Status (holiday-adaptive) ---
-# =========================================================
 def ema_status_alert():
-    ist = pytz.timezone("Asia/Kolkata")
-    today = datetime.datetime.now(ist).date()
-    if is_market_holiday(today):
-        print("🏖️ Market closed today — skipping 10AM EMA alert.")
-        return
-
     df = get_data_fyers() or get_data_yfinance()
     if df is None or len(df) < 21:
         print("⚠️ No data for EMA status check.")
         return
-
     df["ema5"]  = EMAIndicator(df["close"], window=5).ema_indicator()
     df["ema21"] = EMAIndicator(df["close"], window=21).ema_indicator()
     last = df.iloc[-1]
@@ -242,15 +195,25 @@ def ema_status_alert():
     send_alert(msg)
 
 # =========================================================
-# --- Scheduler loop ---
+# --- Scheduler Thread + Flask App ---
 # =========================================================
-print("🚀 NIFTY-50 Alert System started (15 min + 10 AM EMA summary)")
+app = Flask(__name__)
 
-refresh_fyers_token()
-job()
-schedule.every(15).minutes.do(job)
-schedule.every().day.at("10:00").do(ema_status_alert)
+@app.route("/")
+def home():
+    return "✅ NIFTY Alert Bot is running on Render Free Tier."
 
-while True:
-    schedule.run_pending()
-    time.sleep(30)
+def scheduler_loop():
+    refresh_fyers_token()
+    job()
+    schedule.every(15).minutes.do(job)
+    schedule.every().day.at("10:00").do(ema_status_alert)
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+if __name__ == "__main__":
+    print("🚀 Starting NIFTY-50 Alert System (Render mode)")
+    t = threading.Thread(target=scheduler_loop, daemon=True)
+    t.start()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))

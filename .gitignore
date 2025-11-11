@@ -1,0 +1,19 @@
+# Ignore config and secret files
+config.json
+*.env
+__pycache__/
+*.pyc
+
+# VS Code and virtual environment
+.vscode/
+.venv/
+env/
+venv/
+
+# OS/system files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary data
+*.log
+logs/
