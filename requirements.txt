@@ -1,0 +1,7 @@
+fyers-apiv2
+pandas
+numpy
+ta
+yfinance
+requests
+schedule

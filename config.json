@@ -1,0 +1,10 @@
+{
+  "client_id": "YOUR_FYERS_CLIENT_ID",
+  "secret_key": "YOUR_SECRET_KEY",
+  "redirect_uri": "https://127.0.0.1/",
+  "access_token": "FIRST_ACCESS_TOKEN",
+  "refresh_token": "YOUR_REFRESH_TOKEN",
+  "whatsapp_url": "https://api.callmebot.com/whatsapp.php?phone=919643874990&apikey=YOURKEY",
+  "email_webhook": "https://hooks.zapier.com/hooks/catch/25329406/u8u326j/",
+  "debug_mode": true
+}
